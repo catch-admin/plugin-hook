@@ -1,0 +1,29 @@
+{
+    "name": "catchadmin/plugin-hook",
+    "description": "CatchAdmin 插件钩子系统 - 在安装/卸载自定义插件时触发生命周期钩子",
+    "type": "composer-plugin",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "Catch\\PluginHook\\": "src/"
+        }
+    },
+    "require": {
+        "php": "^8.1",
+        "composer-plugin-api": "^2.0"
+    },
+    "require-dev": {
+        "composer/composer": "^2.0"
+    },
+    "authors": [
+        {
+            "name": "OneOuts",
+            "email": "njphper@gmail.com"
+        }
+    ],
+    "extra": {
+        "class": "Catch\\PluginHook\\PluginHook"
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

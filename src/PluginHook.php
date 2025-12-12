@@ -16,37 +16,32 @@ use Composer\DependencyResolver\Operation\InstallOperation;
 use Composer\DependencyResolver\Operation\UninstallOperation;
 use Composer\DependencyResolver\Operation\UpdateOperation;
 use Composer\Package\PackageInterface;
-use Catch\PluginHook\Support\PluginPackageResolver;
+use Catch\Plugin\Support\InstalledPluginManager;
 
 /**
  * CatchAdmin 插件钩子
  * 
- * Hook 方法对应：
- * - beforeInstall   → PRE_PACKAGE_INSTALL（可阻止安装）
- * - afterInstall    → POST_AUTOLOAD_DUMP（可使用 Laravel）
- * - beforeUpdate    → PRE_PACKAGE_UPDATE（更新前）
- * - afterUpdate     → POST_AUTOLOAD_DUMP（更新后，可使用 Laravel）
- * - beforeUninstall → PRE_PACKAGE_UNINSTALL（包还在）
- * - afterUninstall  → POST_AUTOLOAD_DUMP（autoload 生成后）
+ * 监听 Composer 事件，在 POST_AUTOLOAD_DUMP 时更新插件记录并执行 Hook
+ * 插件记录存储在 config('plugin.installed_file') 指定的 JSON 文件中
  */
 class PluginHook implements PluginInterface, EventSubscriberInterface
 {
+    protected Composer $composer;
     protected IOInterface $io;
-    protected PluginPackageResolver $resolver;
     
-    /** @var array<string, array> 待执行 afterInstall 的插件 */
+    /** @var array<string, array> 待记录的安装插件 */
     protected array $pendingInstalls = [];
     
-    /** @var array<string, array> 待执行 afterUpdate 的插件 */
+    /** @var array<string, array> 待更新的插件 */
     protected array $pendingUpdates = [];
     
-    /** @var array<string, array> 待执行 afterUninstall 的插件 */
+    /** @var array<string, array> 待删除的插件 */
     protected array $pendingUninstalls = [];
 
     public function activate(Composer $composer, IOInterface $io): void
     {
+        $this->composer = $composer;
         $this->io = $io;
-        $this->resolver = new PluginPackageResolver();
     }
 
     public function deactivate(Composer $composer, IOInterface $io): void {}
@@ -70,7 +65,10 @@ class PluginHook implements PluginInterface, EventSubscriberInterface
     {
         $op = $event->getOperation();
         if ($op instanceof InstallOperation) {
-            $this->callHook($op->getPackage(), 'beforeInstall');
+            $package = $op->getPackage();
+            if ($package->getType() === 'catchadmin-plugin') {
+                $this->callHook($package, 'beforeInstall');
+            }
         }
     }
 
@@ -78,10 +76,21 @@ class PluginHook implements PluginInterface, EventSubscriberInterface
     {
         $op = $event->getOperation();
         if ($op instanceof InstallOperation) {
-            $pluginInfo = $this->resolver->resolve($op->getPackage());
-            if ($pluginInfo && isset($pluginInfo['extra']['hook'])) {
-                $this->pendingInstalls[$op->getPackage()->getName()] = $pluginInfo;
+            $package = $op->getPackage();
+            
+            if ($package->getType() !== 'catchadmin-plugin') {
+                return;
             }
+
+            $packageName = $package->getName();
+            $installPath = $this->composer->getInstallationManager()->getInstallPath($package);
+            
+            $this->pendingInstalls[$packageName] = [
+                'name' => $packageName,
+                'version' => $package->getVersion(),
+                'path' => $installPath,
+                'hook' => $package->getExtra()['hook'] ?? null,
+            ];
         }
     }
 
@@ -89,13 +98,31 @@ class PluginHook implements PluginInterface, EventSubscriberInterface
     {
         $op = $event->getOperation();
         if ($op instanceof UninstallOperation) {
-            $this->callHook($op->getPackage(), 'beforeUninstall');
+            $package = $op->getPackage();
             
-            // 记录待执行 afterUninstall
-            $pluginInfo = $this->resolver->resolve($op->getPackage());
-            if ($pluginInfo && isset($pluginInfo['extra']['hook'])) {
-                $this->pendingUninstalls[$op->getPackage()->getName()] = $pluginInfo;
+            if ($package->getType() !== 'catchadmin-plugin') {
+                return;
             }
+
+            $packageName = $package->getName();
+            $installPath = $this->composer->getInstallationManager()->getInstallPath($package);
+            
+            // 执行 beforeUninstall Hook（包还在）
+            $hookClass = $package->getExtra()['hook'] ?? null;
+            if ($hookClass) {
+                $this->loadHookClass($package, $hookClass);
+                if (class_exists($hookClass) && method_exists($hookClass, 'beforeUninstall')) {
+                    call_user_func([$hookClass, 'beforeUninstall'], [
+                        'name' => $packageName,
+                        'path' => $installPath,
+                    ]);
+                }
+            }
+            
+            $this->pendingUninstalls[$packageName] = [
+                'name' => $packageName,
+                'hook' => $hookClass,
+            ];
         }
     }
 
@@ -108,9 +135,10 @@ class PluginHook implements PluginInterface, EventSubscriberInterface
     {
         $op = $event->getOperation();
         if ($op instanceof UpdateOperation) {
-            // beforeUpdate: 与 beforeInstall 相同，只做基本检测
-            // 不执行任何包中的代码（新包还没安装）
-            $this->callHook($op->getTargetPackage(), 'beforeUpdate');
+            $package = $op->getTargetPackage();
+            if ($package->getType() === 'catchadmin-plugin') {
+                $this->callHook($package, 'beforeUpdate');
+            }
         }
     }
 
@@ -118,69 +146,98 @@ class PluginHook implements PluginInterface, EventSubscriberInterface
     {
         $op = $event->getOperation();
         if ($op instanceof UpdateOperation) {
-            $pluginInfo = $this->resolver->resolve($op->getTargetPackage());
-            if ($pluginInfo && isset($pluginInfo['extra']['hook'])) {
-                $this->pendingUpdates[$op->getTargetPackage()->getName()] = $pluginInfo;
+            $package = $op->getTargetPackage();
+            
+            if ($package->getType() !== 'catchadmin-plugin') {
+                return;
             }
+
+            $packageName = $package->getName();
+            $installPath = $this->composer->getInstallationManager()->getInstallPath($package);
+            
+            $this->pendingUpdates[$packageName] = [
+                'name' => $packageName,
+                'version' => $package->getVersion(),
+                'path' => $installPath,
+                'hook' => $package->getExtra()['hook'] ?? null,
+            ];
         }
     }
 
     /**
-     * autoload 生成后执行 afterInstall/afterUpdate/afterUninstall
+     * autoload 生成后执行插件记录更新和 Hook
      */
     public function onPostAutoloadDump(Event $event): void
     {
-        // 执行 afterInstall
+        $manager = new InstalledPluginManager();
+
+        // 处理安装的插件
         foreach ($this->pendingInstalls as $name => $pluginInfo) {
-            $hookClass = $pluginInfo['extra']['hook'];
-            if (class_exists($hookClass) && method_exists($hookClass, 'afterInstall')) {
+            $manager->add([
+                'name' => $name,
+                'version' => $pluginInfo['version'] ?? '',
+                'type' => 'catchadmin-plugin',
+                'path' => $pluginInfo['path'] ?? '',
+            ]);
+
+            // 执行 afterInstall Hook
+            $hookClass = $pluginInfo['hook'] ?? null;
+            if ($hookClass && class_exists($hookClass) && method_exists($hookClass, 'afterInstall')) {
                 call_user_func([$hookClass, 'afterInstall'], $pluginInfo);
             }
         }
         $this->pendingInstalls = [];
 
-        // 执行 afterUpdate
+        // 处理更新的插件
         foreach ($this->pendingUpdates as $name => $pluginInfo) {
-            $hookClass = $pluginInfo['extra']['hook'];
-            if (class_exists($hookClass) && method_exists($hookClass, 'afterUpdate')) {
+            $manager->update($name, [
+                'version' => $pluginInfo['version'] ?? '',
+            ]);
+
+            // 执行 afterUpdate Hook
+            $hookClass = $pluginInfo['hook'] ?? null;
+            if ($hookClass && class_exists($hookClass) && method_exists($hookClass, 'afterUpdate')) {
                 call_user_func([$hookClass, 'afterUpdate'], $pluginInfo);
             }
         }
         $this->pendingUpdates = [];
 
-        // 执行 afterUninstall
+        // 处理卸载的插件
         foreach ($this->pendingUninstalls as $name => $pluginInfo) {
-            $hookClass = $pluginInfo['extra']['hook'];
-            if (class_exists($hookClass) && method_exists($hookClass, 'afterUninstall')) {
+            // 执行 afterUninstall Hook
+            $hookClass = $pluginInfo['hook'] ?? null;
+            if ($hookClass && class_exists($hookClass) && method_exists($hookClass, 'afterUninstall')) {
                 call_user_func([$hookClass, 'afterUninstall'], $pluginInfo);
             }
+
+            $manager->remove($name);
         }
         $this->pendingUninstalls = [];
     }
 
     /**
-     * 调用 Hook 方法（用于 beforeInstall/beforeUpdate/beforeUninstall）
+     * 调用 Hook 方法（用于 beforeInstall/beforeUpdate，此时 autoload 未生成）
      */
     protected function callHook(PackageInterface $package, string $method): void
     {
-        $pluginInfo = $this->resolver->resolve($package);
-        
-        if (!$pluginInfo || !isset($pluginInfo['extra']['hook'])) {
+        $hookClass = $package->getExtra()['hook'] ?? null;
+        if (!$hookClass) {
             return;
         }
 
-        $hookClass = $pluginInfo['extra']['hook'];
-        
-        // 手动加载类（autoload 可能未生成）
         $this->loadHookClass($package, $hookClass);
 
         if (class_exists($hookClass) && method_exists($hookClass, $method)) {
-            call_user_func([$hookClass, $method], $pluginInfo);
+            call_user_func([$hookClass, $method], [
+                'name' => $package->getName(),
+                'version' => $package->getVersion(),
+                'path' => $this->composer->getInstallationManager()->getInstallPath($package),
+            ]);
         }
     }
 
     /**
-     * 手动加载 Hook 类
+     * 手动加载 Hook 类（autoload 未生成时使用）
      */
     protected function loadHookClass(PackageInterface $package, string $hookClass): void
     {

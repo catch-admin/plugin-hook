@@ -51,25 +51,12 @@ class PluginHook implements PluginInterface, EventSubscriberInterface
     public static function getSubscribedEvents(): array
     {
         return [
-            PackageEvents::PRE_PACKAGE_INSTALL => 'onPrePackageInstall',
             PackageEvents::POST_PACKAGE_INSTALL => 'onPostPackageInstall',
             PackageEvents::PRE_PACKAGE_UNINSTALL => 'onPrePackageUninstall',
             PackageEvents::POST_PACKAGE_UNINSTALL => 'onPostPackageUninstall',
-            PackageEvents::PRE_PACKAGE_UPDATE => 'onPrePackageUpdate',
             PackageEvents::POST_PACKAGE_UPDATE => 'onPostPackageUpdate',
             ScriptEvents::POST_AUTOLOAD_DUMP => 'onPostAutoloadDump',
         ];
-    }
-
-    public function onPrePackageInstall(PackageEvent $event): void
-    {
-        $op = $event->getOperation();
-        if ($op instanceof InstallOperation) {
-            $package = $op->getPackage();
-            if ($package->getType() === 'catchadmin-plugin') {
-                $this->callHook($package, 'beforeInstall');
-            }
-        }
     }
 
     public function onPostPackageInstall(PackageEvent $event): void
@@ -84,6 +71,18 @@ class PluginHook implements PluginInterface, EventSubscriberInterface
 
             $packageName = $package->getName();
             $installPath = $this->composer->getInstallationManager()->getInstallPath($package);
+            
+            // 执行 beforeInstall Hook（包已下载，可加载）
+            try {
+                $this->callHook($package, 'beforeInstall');
+            } catch (\Throwable $e) {
+                // 验证失败，提示用户手动清理
+                $this->io->writeError("");
+                $this->io->writeError("<error>插件安装验证失败: {$e->getMessage()}</error>");
+                $this->io->writeError("<warning>请运行以下命令清理: composer remove {$packageName}</warning>");
+                $this->io->writeError("");
+                throw $e;
+            }
             
             $this->pendingInstalls[$packageName] = [
                 'name' => $packageName,
@@ -131,17 +130,6 @@ class PluginHook implements PluginInterface, EventSubscriberInterface
         // afterUninstall 在 POST_AUTOLOAD_DUMP 执行
     }
 
-    public function onPrePackageUpdate(PackageEvent $event): void
-    {
-        $op = $event->getOperation();
-        if ($op instanceof UpdateOperation) {
-            $package = $op->getTargetPackage();
-            if ($package->getType() === 'catchadmin-plugin') {
-                $this->callHook($package, 'beforeUpdate');
-            }
-        }
-    }
-
     public function onPostPackageUpdate(PackageEvent $event): void
     {
         $op = $event->getOperation();
@@ -154,6 +142,9 @@ class PluginHook implements PluginInterface, EventSubscriberInterface
 
             $packageName = $package->getName();
             $installPath = $this->composer->getInstallationManager()->getInstallPath($package);
+            
+            // 执行 beforeUpdate Hook（包已下载，可加载）
+            $this->callHook($package, 'beforeUpdate');
             
             $this->pendingUpdates[$packageName] = [
                 'name' => $packageName,
@@ -245,8 +236,8 @@ class PluginHook implements PluginInterface, EventSubscriberInterface
             return;
         }
 
-        $vendorDir = getcwd() . '/vendor';
-        $packagePath = $vendorDir . '/' . $package->getName();
+        // 使用实际安装路径（支持 symlink/junction）
+        $packagePath = $this->composer->getInstallationManager()->getInstallPath($package);
 
         $autoload = $package->getAutoload();
         foreach ($autoload['psr-4'] ?? [] as $namespace => $path) {
